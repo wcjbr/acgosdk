@@ -1,0 +1,8 @@
+name: acgo_sdk
+description: Unofficial Dart SDK for ACGO APIs.
+version: 0.1.0
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  crypto: ^3.0.6

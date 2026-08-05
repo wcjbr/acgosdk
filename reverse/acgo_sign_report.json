@@ -1,0 +1,147 @@
+{
+  "version": 1,
+  "size": 16058,
+  "sections": [
+    {
+      "id": 1,
+      "name": "type",
+      "offset": 10,
+      "size": 67
+    },
+    {
+      "id": 2,
+      "name": "import",
+      "offset": 79,
+      "size": 13
+    },
+    {
+      "id": 3,
+      "name": "function",
+      "offset": 94,
+      "size": 24
+    },
+    {
+      "id": 4,
+      "name": "table",
+      "offset": 120,
+      "size": 5
+    },
+    {
+      "id": 5,
+      "name": "memory",
+      "offset": 127,
+      "size": 6
+    },
+    {
+      "id": 6,
+      "name": "global",
+      "offset": 135,
+      "size": 9
+    },
+    {
+      "id": 7,
+      "name": "export",
+      "offset": 146,
+      "size": 33
+    },
+    {
+      "id": 9,
+      "name": "element",
+      "offset": 181,
+      "size": 7
+    },
+    {
+      "id": 10,
+      "name": "code",
+      "offset": 191,
+      "size": 15207
+    },
+    {
+      "id": 11,
+      "name": "data",
+      "offset": 15401,
+      "size": 657
+    }
+  ],
+  "imports": [
+    {
+      "module": "a",
+      "name": "a",
+      "kind": 0,
+      "type_index": 4
+    },
+    {
+      "module": "a",
+      "name": "b",
+      "kind": 0,
+      "type_index": 0
+    }
+  ],
+  "exports": [
+    {
+      "name": "c",
+      "kind": 2,
+      "index": 0
+    },
+    {
+      "name": "d",
+      "kind": 0,
+      "index": 13
+    },
+    {
+      "name": "e",
+      "kind": 0,
+      "index": 21
+    },
+    {
+      "name": "f",
+      "kind": 0,
+      "index": 20
+    },
+    {
+      "name": "g",
+      "kind": 1,
+      "index": 0
+    },
+    {
+      "name": "h",
+      "kind": 0,
+      "index": 24
+    },
+    {
+      "name": "i",
+      "kind": 0,
+      "index": 23
+    },
+    {
+      "name": "j",
+      "kind": 0,
+      "index": 22
+    }
+  ],
+  "function_type_indices": [
+    0,
+    6,
+    2,
+    0,
+    1,
+    2,
+    0,
+    5,
+    7,
+    3,
+    2,
+    9,
+    2,
+    5,
+    2,
+    0,
+    3,
+    1,
+    0,
+    1,
+    0,
+    10,
+    4
+  ]
+}
