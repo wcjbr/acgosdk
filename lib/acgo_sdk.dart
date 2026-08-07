@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -437,20 +438,20 @@ class AcgoClient {
   }
 
   String? _findFirstString(Object? payload, List<String> keys) {
-    if (payload is Map) {
-      for (final key in keys) {
-        final value = payload[key];
-        if (value is String && value.isNotEmpty) return value;
-      }
-      for (final value in payload.values) {
-        final found = _findFirstString(value, keys);
-        if (found != null) return found;
-      }
-    }
-    if (payload is List) {
-      for (final item in payload) {
-        final found = _findFirstString(item, keys);
-        if (found != null) return found;
+    final seen = HashSet.identity();
+    final stack = <Object?>[payload];
+    while (stack.isNotEmpty) {
+      final current = stack.removeLast();
+      if (current is Map) {
+        if (!seen.add(current)) continue;
+        for (final key in keys) {
+          final value = current[key];
+          if (value is String && value.isNotEmpty) return value;
+        }
+        stack.addAll(current.values);
+      } else if (current is List) {
+        if (!seen.add(current)) continue;
+        stack.addAll(current.reversed);
       }
     }
     return null;
