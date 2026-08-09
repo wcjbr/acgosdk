@@ -924,6 +924,334 @@ class AcgoClient {
   int _u16be(Uint8List b, int i) => (b[i] << 8) | b[i + 1];
   int _u16le(Uint8List b, int i) => b[i] | (b[i + 1] << 8);
 
+  Future<Object?> listMatches([Map<String, Object?>? params]) {
+    final query = <String, Object?>{...?params};
+    final teamCode = query['teamcode'] ?? query['teamCode'];
+    final path = teamCode == null
+        ? '/acgoMatch/v1/match/list'
+        : '/acgoMatch/api/team/${Uri.encodeComponent('$teamCode')}/match/list';
+    return get(path, params: query);
+  }
+
+  Future<Object?> listMyMatches([Map<String, Object?>? params]) =>
+      get('/acgoMatch/v1/user/matchList', params: params);
+
+  Future<Object?> getMatchInfo([Map<String, Object?>? params]) {
+    final query = <String, Object?>{...?params};
+    final path = query['teamCode'] == null
+        ? '/acgoMatch/v1/match/info'
+        : '/acgoMatch/api/team/match/info';
+    return get(path, params: query);
+  }
+
+  Future<Object?> applyMatch([Map<String, Object?>? params]) =>
+      get('/acgoMatch/v1/match/apply', params: params);
+
+  Future<Object?> startMatch([Map<String, Object?>? params]) =>
+      get('/acgoMatch/v1/apply/matchStart', params: params);
+
+  Future<Object?> enterExam(
+    Object examId, {
+    Object? matchRoundId,
+    Map<String, Object?>? payload,
+  }) {
+    final body = <String, Object?>{...?payload};
+    if (examId is Map) {
+      body.addAll(Map<String, Object?>.from(examId));
+    } else {
+      body['examId'] = examId;
+    }
+    if (matchRoundId != null) body['matchRoundId'] = matchRoundId;
+    return post('/acgoMatch/api/exam/enter', body);
+  }
+
+  Future<Object?> joinExam(
+    Object examId, {
+    Object? matchRoundId,
+    Map<String, Object?>? payload,
+  }) =>
+      enterExam(examId, matchRoundId: matchRoundId, payload: payload);
+
+  Future<Object?> getExamPaper([Map<String, Object?>? params]) {
+    final query = <String, Object?>{...?params};
+    final teamCode = query['teamCode'];
+    final path = teamCode == null
+        ? '/acgoMatch/v1/match/paperInfo'
+        : '/acgoMatch/api/team/${Uri.encodeComponent('$teamCode')}/paperInfo';
+    return get(path, params: query);
+  }
+
+  Future<Object?> getExamAnswerRecord([Map<String, Object?>? params]) {
+    final query = <String, Object?>{...?params};
+    final teamCode = query['teamCode'];
+    final path = teamCode == null
+        ? '/acgoMatch/v1/match/userAnswerRecord'
+        : '/acgoMatch/api/team/${Uri.encodeComponent('$teamCode')}/userAnswerRecord';
+    return get(path, params: query);
+  }
+
+  Future<Map<String, Object?>> getExamQuestions([
+    Map<String, Object?>? params,
+  ]) async {
+    final paper = await getExamPaper(params);
+    final record = await getExamAnswerRecord(params);
+    return _mergePaperAndAnswerRecord(paper, record);
+  }
+
+  Future<Object?> listLeaderboardQuestions([Map<String, Object?>? payload]) =>
+      post('/acgoMatch/leaderboard/questionList', payload);
+
+  Future<Object?> listQuestionAnswerRecords([Map<String, Object?>? payload]) =>
+      post('/acgoMatch/questionAnsweRecord/list', payload);
+
+  Future<Object?> viewQuestionAnswerRecord([Map<String, Object?>? payload]) =>
+      post('/acgoMatch/questionAnsweRecord/view', payload);
+
+  Future<Object?> getPracticeMatchSources() =>
+      get('/acgoMatch/v1/practice/matchSource/all');
+
+  Future<Object?> getPracticeSelectMenu([Map<String, Object?>? params]) =>
+      get('/acgoMatch/v1/practice/selectMenu', params: params);
+
+  Future<Object?> verifyPracticeMatch([Map<String, Object?>? params]) =>
+      get('/acgoMatch/v1/practice/verifyMatch', params: params);
+
+  Future<Object?> getPracticePaper([
+    Map<String, Object?>? params,
+    bool open = false,
+  ]) =>
+      get(
+        '/acgoMatch/v1/practice${open ? '/open' : ''}/matchPaperInfo',
+        params: params,
+      );
+
+  Future<Object?> getPracticeAnswerRecord([
+    Map<String, Object?>? params,
+    bool open = false,
+  ]) =>
+      get(
+        '/acgoMatch/v1/practice${open ? '/open' : ''}/userAnswerRecord',
+        params: params,
+      );
+
+  Future<Map<String, Object?>> getPracticeQuestions([
+    Map<String, Object?>? params,
+    bool open = false,
+  ]) async {
+    final paper = await getPracticePaper(params, open);
+    final record = await getPracticeAnswerRecord(params, open);
+    return _mergePaperAndAnswerRecord(paper, record);
+  }
+
+  Future<Object?> getPracticeMatchScore([Map<String, Object?>? params]) =>
+      get('/acgoMatch/v1/practice/matchScore', params: params);
+
+  Stream<Map<String, Object?>> watchPrivateMessages(
+    String receiverId, {
+    String? userConversationsId,
+    String messageId = '0',
+    Duration interval = const Duration(seconds: 2),
+  }) {
+    final controller = StreamController<Map<String, Object?>>();
+    var cancelled = false;
+
+    Future<void> loop() async {
+      final conversationId = userConversationsId ??
+          await _resolvePrivateConversationId(receiverId);
+      if (conversationId == null) {
+        throw StateError('private conversation not found for $receiverId');
+      }
+      var cursor = messageId;
+      final seen = <String>{};
+
+      while (!cancelled) {
+        final payload =
+            await listPrivateMessages(conversationId, messageId: cursor);
+        final messages = _extractPrivateMessages(payload);
+        final fresh = <Map<String, Object?>>[];
+        for (final item in messages) {
+          if (item is! Map) continue;
+          final message = Map<String, Object?>.from(item);
+          final id = _messageId(message);
+          if (id == null || seen.contains(id)) continue;
+          seen.add(id);
+          fresh.add(message);
+        }
+        fresh.sort(_compareMessageId);
+        if (fresh.isNotEmpty) {
+          final latestId = _messageId(fresh.last);
+          if (latestId != null) cursor = latestId;
+          for (final item in fresh) {
+            if (!controller.isClosed) controller.add(item);
+          }
+        }
+        if (cancelled) break;
+        await Future<void>.delayed(interval);
+      }
+      if (!controller.isClosed) await controller.close();
+    }
+
+    controller.onListen = () {
+      loop();
+    };
+    controller.onCancel = () async {
+      cancelled = true;
+    };
+    return controller.stream;
+  }
+
+  Map<String, Object?> _mergePaperAndAnswerRecord(
+    Object? paperPayload,
+    Object? recordPayload,
+  ) {
+    final paper = _payloadData(paperPayload);
+    final record = _payloadData(recordPayload);
+    final answerList = record is Map && record['list'] is List
+        ? record['list'] as List
+        : const [];
+    final problemList = paper is Map && paper['problemList'] is List
+        ? _deepCopyList(paper['problemList'] as List)
+        : <Object?>[];
+    var total = 0;
+    var accepted = 0;
+
+    for (final problem in problemList) {
+      if (problem is! Map) continue;
+      final questions = problem['questionList'];
+      if (questions is! List) continue;
+      for (final question in questions) {
+        if (question is! Map) continue;
+        final questionTypeObject = question['questionTypeObject'];
+        if (questionTypeObject is Map &&
+            questionTypeObject['exampleGroupList'] is List) {
+          questionTypeObject['exampleGroupList'] =
+              (questionTypeObject['exampleGroupList'] as List)
+                  .where(
+                    (item) =>
+                        item is Map &&
+                        (item['inputSample'] != null ||
+                            item['outputSample'] != null),
+                  )
+                  .toList();
+        }
+        final subQuestions = questionTypeObject is Map
+            ? questionTypeObject['subQuestionList']
+            : null;
+        if (subQuestions is List) {
+          var allAccepted = subQuestions.isNotEmpty;
+          for (final sub in subQuestions) {
+            if (sub is! Map) continue;
+            total += 1;
+            final answer = _findQuestionAnswer(
+              answerList,
+              problem['problemSetId'],
+              sub['questionId'],
+            );
+            if (answer?['status'] == 1) accepted += 1;
+            if (answer?['status'] != 1) allAccepted = false;
+            sub['userAnswer'] = answer;
+          }
+          question['userAnswer'] = {'status': allAccepted ? 1 : 2};
+        } else {
+          total += 1;
+          final answer = _findQuestionAnswer(
+            answerList,
+            problem['problemSetId'],
+            question['questionId'],
+          );
+          if (answer?['status'] == 1) accepted += 1;
+          final list = answer?['list'];
+          if (answer != null && list is List) _groupProgramSubtasks(answer);
+          question['userAnswer'] = answer;
+        }
+      }
+    }
+
+    Object? scoreResult = record is Map ? record['scoreResult'] : null;
+    if (scoreResult is Map) {
+      scoreResult = Map<String, Object?>.from(scoreResult);
+      if (total > 0) {
+        scoreResult['accuracy'] = '${(accepted * 100 / total).round()}%';
+      }
+    }
+    return {
+      'title': paper is Map ? paper['examPaperTitle'] : null,
+      'scoreResult': scoreResult,
+      'problemList': problemList,
+      'paper': paperPayload,
+      'answerRecord': recordPayload,
+    };
+  }
+
+  Object? _payloadData(Object? payload) {
+    if (payload is Map && payload['data'] is Map) return payload['data'];
+    return payload;
+  }
+
+  List<Object?> _extractPrivateMessages(Object? payload) {
+    final data = _payloadData(payload);
+    if (data is Map && data['list'] is List)
+      return data['list'] as List<Object?>;
+    if (data is Map && data['records'] is List)
+      return data['records'] as List<Object?>;
+    if (data is Map && data['messages'] is List)
+      return data['messages'] as List<Object?>;
+    if (data is List) return data;
+    return const [];
+  }
+
+  String? _messageId(Map<String, Object?> message) {
+    for (final key in ['messageId', 'id', 'chatId', 'msgId']) {
+      final value = message[key];
+      if (value != null && '$value'.isNotEmpty) return '$value';
+    }
+    return null;
+  }
+
+  int _compareMessageId(Map<String, Object?> left, Map<String, Object?> right) {
+    final l = _messageId(left);
+    final r = _messageId(right);
+    final ln = int.tryParse(l ?? '');
+    final rn = int.tryParse(r ?? '');
+    if (ln != null && rn != null && ln != rn) return ln.compareTo(rn);
+    return (l ?? '').compareTo(r ?? '');
+  }
+
+  Map<String, Object?>? _findQuestionAnswer(
+    List answerList,
+    Object? problemSetId,
+    Object? questionId,
+  ) {
+    for (final item in answerList) {
+      if (item is Map &&
+          '${item['problemSetId']}' == '$problemSetId' &&
+          '${item['questionId']}' == '$questionId') {
+        return Map<String, Object?>.from(item);
+      }
+    }
+    return null;
+  }
+
+  void _groupProgramSubtasks(Map<String, Object?> answer) {
+    final list = answer['list'];
+    if (list is! List) return;
+    var subtaskMode = false;
+    final grouped = <int, List<Object?>>{};
+    for (final item in list) {
+      final subtaskNo = item is Map && item['subtaskNo'] is num
+          ? (item['subtaskNo'] as num).toInt()
+          : 0;
+      if (subtaskNo > 0) subtaskMode = true;
+      grouped.putIfAbsent(subtaskNo, () => <Object?>[]).add(item);
+    }
+    final keys = grouped.keys.toList()..sort();
+    answer['list'] = [for (final key in keys) grouped[key]];
+    answer['subtaskMode'] = subtaskMode;
+  }
+
+  List<Object?> _deepCopyList(List value) =>
+      (jsonDecode(jsonEncode(value)) as List).cast<Object?>();
+
   Future<Object?> submitProblem(
     String problemId,
     String code,
