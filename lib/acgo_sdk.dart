@@ -1066,7 +1066,7 @@ class AcgoClient {
 
       while (!cancelled) {
         final payload =
-            await listPrivateMessages(conversationId, messageId: cursor);
+            await listPrivateMessages(conversationId!, messageId: cursor);
         final messages = _extractPrivateMessages(payload);
         final fresh = <Map<String, Object?>>[];
         for (final item in messages) {
