@@ -3,28 +3,41 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:agora_rtm/agora_rtm.dart';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart';
 
+/// Exception thrown when an ACGO API request fails.
 class AcgoApiException implements Exception {
+  /// Creates an API exception with the HTTP status, message, and optional body.
   AcgoApiException(this.statusCode, this.message, [this.body]);
 
+  /// HTTP status code returned by the server.
   final int statusCode;
+
+  /// Human-readable error message.
   final String message;
+
+  /// Raw response body or decoded payload when available.
   final Object? body;
 
   @override
   String toString() => 'ACGO API error $statusCode: $message';
 }
 
+/// Generates request signatures and password hashes for ACGO APIs.
 class AcgoSigner {
+  /// Creates a signer instance.
   AcgoSigner();
 
+  /// Salt used by the legacy MD5 signature scheme.
   static const md5Salt = '25d634bc1b39e11129fbe37a8cff7e18';
+
+  /// Secret key used to build the HMAC-SHA512 signature.
   static const sha512KeyString = 'Y1MBbjtNw4ibPHfgR8zxew9HIMUwJv03';
 
+  /// Back-reference to the client used for timestamp synchronization.
   late AcgoClient client;
   int? _serverTime;
   DateTime? _serverTimeSyncedAt;
@@ -38,6 +51,7 @@ class AcgoSigner {
     return serverTime + DateTime.now().difference(syncedAt).inSeconds;
   }
 
+  /// Synchronizes the local clock with the server time endpoint.
   Future<int> syncServerTime() async {
     final value = await client.requestServerTimestamp();
     _serverTime = value;
@@ -45,11 +59,13 @@ class AcgoSigner {
     return value;
   }
 
+  /// Returns a server-aligned timestamp, syncing first if needed.
   Future<int> serverTimestamp() async {
     if (_serverTime == null) return syncServerTime();
     return _now();
   }
 
+  /// Creates the request signature payload for the given source string.
   Future<Map<String, Object>> requestSign(String source) async {
     final timestamp = await serverTimestamp();
     final wasmSign = aaa1(source, '$timestamp');
@@ -60,6 +76,7 @@ class AcgoSigner {
     return {'timestamp': timestamp, 'signString': sign};
   }
 
+  /// Hashes a password using the ACGO signing scheme.
   Future<String> passwordHash(String password, {int? timestamp}) async {
     final ts = timestamp ?? await serverTimestamp();
     final digest = md5.convert(utf8.encode(password)).toString();
@@ -69,14 +86,18 @@ class AcgoSigner {
     ).convert(utf8.encode('$ts$digest')).toString();
   }
 
+  /// Returns the fixed fp2 value expected by the current backend.
   String getF2Hash() => '1234567';
 
+  /// Computes the legacy MD5 signature seed used by the backend.
   String aaa1(String source, String timestamp) {
     return md5.convert(utf8.encode(md5Salt + timestamp + source)).toString();
   }
 }
 
+/// Image metadata returned by [AcgoClient.uploadImage].
 class UploadedImage {
+  /// Creates an uploaded image descriptor.
   UploadedImage({
     required this.fileSrc,
     required this.raw,
@@ -84,13 +105,22 @@ class UploadedImage {
     this.height,
   });
 
+  /// Public file URL returned by the upload service.
   final String fileSrc;
+
+  /// Raw upload response payload.
   final Map<String, Object?> raw;
+
+  /// Original or derived image width, when available.
   final int? width;
+
+  /// Original or derived image height, when available.
   final int? height;
 }
 
+/// Client for ACGO account, messaging, match, and exam APIs.
 class AcgoClient {
+  /// Creates a client for the configured ACGO gateway and SSO endpoints.
   AcgoClient({
     this.baseUrl = 'https://gateway.acgo.cn',
     this.ssoBaseUrl = 'https://gateway.acgo.cn/acgoAccount',
@@ -98,17 +128,29 @@ class AcgoClient {
     this.authorization,
     this.accessToken,
     this.csrfToken,
+    this.privateMessageUserId,
     this.timeout = const Duration(seconds: 30),
     this.debug = false,
   }) : signer = AcgoSigner() {
     signer.client = this;
   }
 
+  /// REST path used to send a private message.
   static const privateMessagePath = '/acgoMsg/conversations/sendMessage';
+
+  /// Agora RTM application ID used for private message subscriptions.
   static const privateMessageRtmAppId = '775e0ae964ed41d79e9ca817ee6d4b47';
+
+  /// Host used for direct image uploads.
   static const imageUploadHost = 'https://wsupload.xiaomawang.com';
+
+  /// Maximum size accepted for direct image uploads, in bytes.
   static const imageDirectUploadMaxBytes = 4 * 1024 * 1024;
+
+  /// Supported image file extensions for upload.
   static const imageExtensions = {'jpg', 'jpeg', 'png', 'gif'};
+
+  /// Backend numeric message types used by the private messaging API.
   static const privateMessageTypes = {
     'text': 1,
     'image': 2,
@@ -119,19 +161,42 @@ class AcgoClient {
     'auto_reply': 6,
   };
 
+  /// Base API URL.
   String baseUrl;
+
+  /// SSO API URL.
   String ssoBaseUrl;
+
+  /// Application ID used by some ACGO endpoints.
   String appId;
+
+  /// Authorization header value, when required.
   String? authorization;
+
+  /// Access token used for authenticated requests.
   String? accessToken;
+
+  /// SSO access token remembered from login responses.
   String? ssoAccessToken;
+
+  /// CSRF token used for protected requests.
   String? csrfToken;
+
+  /// Current ACGO user ID used to publish desktop RTM private messages.
+  String? privateMessageUserId;
+
+  /// Network timeout applied to HTTP requests.
   Duration timeout;
+
+  /// Enables request/response logging.
   bool debug;
+
+  /// Signature helper bound to this client.
   late AcgoSigner signer;
   final HttpClient _http = HttpClient();
   final Random _random = Random.secure();
   final Set<Future<void> Function()> _rtmCleanups = {};
+  final Map<String, _DesktopRtmBridge> _desktopRtmBridges = {};
 
   Uri _url(String path, [Map<String, Object?>? params]) {
     final uri = Uri.parse(path.startsWith('http') ? path : '$baseUrl$path');
@@ -143,8 +208,10 @@ class AcgoClient {
     return uri.replace(queryParameters: query);
   }
 
+  /// Builds an SSO URI from a relative path.
   Uri _ssoUrl(String path) => Uri.parse('$ssoBaseUrl$path');
 
+  /// Assembles request headers from the configured auth tokens.
   Map<String, String> _headers([Map<String, String>? headers, String? access]) {
     final out = <String, String>{};
     if (authorization != null && authorization!.isNotEmpty) {
@@ -162,6 +229,7 @@ class AcgoClient {
     return out;
   }
 
+  /// Fetches the current server timestamp from the SSO endpoint.
   Future<int> requestServerTimestamp() async {
     final payload = await request(
       'GET',
@@ -183,6 +251,7 @@ class AcgoClient {
     throw AcgoApiException(200, 'Invalid timestamp payload', payload);
   }
 
+  /// Sends an HTTP request to the configured ACGO endpoints.
   Future<Object?> request(
     String method,
     String path, {
@@ -379,12 +448,15 @@ class AcgoClient {
     return null;
   }
 
+  /// Returns a GET request helper.
   Future<Object?> get(String path, {Map<String, Object?>? params}) =>
       request('GET', path, params: params);
 
+  /// Returns a POST request helper.
   Future<Object?> post(String path, [Map<String, Object?>? body]) =>
       request('POST', path, jsonBody: body);
 
+  /// Performs a raw GET without business-error decoding.
   Future<Object?> getRaw(String path, {Map<String, Object?>? params}) =>
       request(
         'GET',
@@ -395,6 +467,7 @@ class AcgoClient {
         injectClientFields: false,
       );
 
+  /// Logs in with an account and password.
   Future<Object?> loginByPassword(
     String account,
     String password, {
@@ -416,6 +489,7 @@ class AcgoClient {
     return result;
   }
 
+  /// Stores authentication tokens found in a login response.
   void _rememberAuth(Object? payload) {
     final token = _findFirstString(payload, const [
       'accessToken',
@@ -440,6 +514,7 @@ class AcgoClient {
     if (csrf != null) csrfToken = csrf;
   }
 
+  /// Returns the first string value for any of the provided keys.
   String? _findFirstString(Object? payload, List<String> keys) {
     final seen = HashSet.identity();
     final stack = <Object?>[payload];
@@ -460,6 +535,7 @@ class AcgoClient {
     return null;
   }
 
+  /// Lists the current user's private conversations.
   Future<Object?> listPrivateConversations({
     String lastUserConversations = '0',
   }) =>
@@ -468,9 +544,11 @@ class AcgoClient {
         params: {'lastUserConversations': lastUserConversations},
       );
 
+  /// Fetches a single private conversation by receiver ID.
   Future<Object?> getPrivateConversation(String receiverId) =>
       getRaw('/acgoMsg/conversations/get', params: {'receiverId': receiverId});
 
+  /// Fetches an RTM token for private message subscription.
   Future<String> getPrivateMessageRtmToken() async {
     final payload = await getRaw('/acgoMsg/conversations/token');
     final token = _findFirstString(payload, ['token']);
@@ -480,6 +558,7 @@ class AcgoClient {
     return token;
   }
 
+  /// Lists private messages for a conversation.
   Future<Object?> listPrivateMessages(
     String userConversationsId, {
     String messageId = '0',
@@ -492,9 +571,11 @@ class AcgoClient {
         },
       );
 
+  /// Recalls a private message by message ID.
   Future<Object?> recallPrivateMessage(String messageId) =>
       post('/acgoMsg/conversations/recall', {'messageId': messageId});
 
+  /// Sends a private text message.
   Future<Object?> sendPrivateText(String receiverId, String text) =>
       sendPrivateMessage(
         receiverId: receiverId,
@@ -502,6 +583,7 @@ class AcgoClient {
         messageType: 'text',
       );
 
+  /// Sends a private emoji or sticker message.
   Future<Object?> sendPrivateEmoji(String receiverId, String emoji) =>
       sendPrivateMessage(
         receiverId: receiverId,
@@ -509,6 +591,7 @@ class AcgoClient {
         messageType: 'sticker',
       );
 
+  /// Sends a private image message from a file or existing URL.
   Future<Object?> sendPrivateImage(
     String receiverId, {
     String? imageUrl,
@@ -537,6 +620,7 @@ class AcgoClient {
     );
   }
 
+  /// Sends a private message with an arbitrary payload.
   Future<Object?> sendPrivateMessage({
     required String receiverId,
     String? content,
@@ -567,7 +651,7 @@ class AcgoClient {
       'timestamp': timestamp,
       'csrfToken': signed['signString'],
     }..removeWhere((_, value) => value == null);
-    return _postRawJson(
+    final result = await _postRawJson(
       '$privateMessagePath?key=$sendKey&timestamp=$timestamp',
       body,
       headers: {
@@ -575,8 +659,18 @@ class AcgoClient {
         'fp2': signer.getF2Hash(),
       },
     );
+    if (Platform.isLinux || Platform.isWindows) {
+      await _publishDesktopPrivateMessage(
+        receiverId: receiverId,
+        messageType: resolvedType,
+        message: message,
+        sendResult: result,
+      );
+    }
+    return result;
   }
 
+  /// Posts JSON to an arbitrary endpoint without client field injection.
   Future<Object?> _postRawJson(
     String path,
     Map<String, Object?> body, {
@@ -597,6 +691,7 @@ class AcgoClient {
     );
   }
 
+  /// Resolves a private conversation ID for the given receiver.
   Future<String?> _resolvePrivateConversationId(String receiverId) async {
     final list = await listPrivateConversations();
     final fromList = _conversationIdFromReceiverList(list, receiverId);
@@ -605,6 +700,7 @@ class AcgoClient {
     return _conversationIdFromPayload(conversation);
   }
 
+  /// Extracts a private conversation ID from the conversation list payload.
   String? _conversationIdFromReceiverList(Object? payload, String receiverId) {
     final data =
         payload is Map && payload['data'] is Map ? payload['data'] : payload;
@@ -621,6 +717,7 @@ class AcgoClient {
     return null;
   }
 
+  /// Extracts a private conversation ID from a direct lookup payload.
   String? _conversationIdFromPayload(Object? payload) {
     if (payload is Map) {
       if (payload['userConversationsId'] != null)
@@ -665,6 +762,7 @@ class AcgoClient {
     return uri.replace(queryParameters: query).toString();
   }
 
+  /// Scales image dimensions to fit the backend display constraints.
   (int?, int?) _privateImageDisplaySize(int? width, int? height) {
     if (width == null || height == null) return (width, height);
     if (width <= 240 && height <= 240) return (width, height);
@@ -673,6 +771,7 @@ class AcgoClient {
     return ((240 * aspect).round(), 240);
   }
 
+  /// Uploads an image and returns the resolved image metadata.
   Future<UploadedImage> uploadImage(String path, {bool scan = true}) async {
     var file = File(path);
     var filename = path.split(Platform.pathSeparator).last;
@@ -721,6 +820,7 @@ class AcgoClient {
     );
   }
 
+  /// Uploads a file with multipart form data.
   Future<Map<String, Object?>> _multipartUpload(
     String url,
     File file,
@@ -791,6 +891,7 @@ class AcgoClient {
     return null;
   }
 
+  /// Returns the MIME type for a filename extension.
   String _contentType(String filename) {
     final ext = filename.split('.').last.toLowerCase();
     return switch (ext) {
@@ -801,6 +902,7 @@ class AcgoClient {
     };
   }
 
+  /// Compresses an oversized image using ImageMagick when available.
   Future<(File, String)> _compressImageExternal(
     File file,
     String filename,
@@ -868,12 +970,14 @@ class AcgoClient {
     throw AcgoApiException(0, 'could not compress image under 4MB');
   }
 
+  /// Finds an executable in the current PATH.
   Future<String?> _which(String name) async {
     final proc = await Process.run('which', [name]);
     if (proc.exitCode == 0) return '${proc.stdout}'.trim();
     return null;
   }
 
+  /// Reads image dimensions from the file header.
   Future<(int?, int?)> _imageDimensions(File file) async {
     final raf = await file.open();
     try {
@@ -923,6 +1027,7 @@ class AcgoClient {
     return (null, null);
   }
 
+  /// Returns whether [bytes] starts with [prefix].
   bool _startsWith(Uint8List bytes, List<int> prefix) {
     if (bytes.length < prefix.length) return false;
     for (var i = 0; i < prefix.length; i++) {
@@ -931,11 +1036,17 @@ class AcgoClient {
     return true;
   }
 
+  /// Reads a big-endian 32-bit integer from [b] at [i].
   int _u32be(Uint8List b, int i) =>
       (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3];
+
+  /// Reads a big-endian 16-bit integer from [b] at [i].
   int _u16be(Uint8List b, int i) => (b[i] << 8) | b[i + 1];
+
+  /// Reads a little-endian 16-bit integer from [b] at [i].
   int _u16le(Uint8List b, int i) => b[i] | (b[i + 1] << 8);
 
+  /// Lists match entries, optionally filtered by team code.
   Future<Object?> listMatches([Map<String, Object?>? params]) {
     final query = <String, Object?>{...?params};
     final teamCode = query['teamcode'] ?? query['teamCode'];
@@ -945,9 +1056,11 @@ class AcgoClient {
     return get(path, params: query);
   }
 
+  /// Lists the current user's matches.
   Future<Object?> listMyMatches([Map<String, Object?>? params]) =>
       get('/acgoMatch/v1/user/matchList', params: params);
 
+  /// Fetches match details.
   Future<Object?> getMatchInfo([Map<String, Object?>? params]) {
     final query = <String, Object?>{...?params};
     final path = query['teamCode'] == null
@@ -956,12 +1069,15 @@ class AcgoClient {
     return get(path, params: query);
   }
 
+  /// Applies for a match.
   Future<Object?> applyMatch([Map<String, Object?>? params]) =>
       get('/acgoMatch/v1/match/apply', params: params);
 
+  /// Starts a match session.
   Future<Object?> startMatch([Map<String, Object?>? params]) =>
       get('/acgoMatch/v1/apply/matchStart', params: params);
 
+  /// Enters an exam using a match or exam identifier.
   Future<Object?> enterExam(
     Object examId, {
     Object? matchRoundId,
@@ -977,6 +1093,7 @@ class AcgoClient {
     return post('/acgoMatch/api/exam/enter', body);
   }
 
+  /// Alias for [enterExam].
   Future<Object?> joinExam(
     Object examId, {
     Object? matchRoundId,
@@ -984,6 +1101,7 @@ class AcgoClient {
   }) =>
       enterExam(examId, matchRoundId: matchRoundId, payload: payload);
 
+  /// Fetches the exam paper payload.
   Future<Object?> getExamPaper([Map<String, Object?>? params]) {
     final query = <String, Object?>{...?params};
     final teamCode = query['teamCode'];
@@ -993,6 +1111,7 @@ class AcgoClient {
     return get(path, params: query);
   }
 
+  /// Fetches the user's answer record for an exam.
   Future<Object?> getExamAnswerRecord([Map<String, Object?>? params]) {
     final query = <String, Object?>{...?params};
     final teamCode = query['teamCode'];
@@ -1002,6 +1121,7 @@ class AcgoClient {
     return get(path, params: query);
   }
 
+  /// Fetches both paper and answer data, then merges them.
   Future<Map<String, Object?>> getExamQuestions([
     Map<String, Object?>? params,
   ]) async {
@@ -1010,24 +1130,31 @@ class AcgoClient {
     return _mergePaperAndAnswerRecord(paper, record);
   }
 
+  /// Lists leaderboard questions.
   Future<Object?> listLeaderboardQuestions([Map<String, Object?>? payload]) =>
       post('/acgoMatch/leaderboard/questionList', payload);
 
+  /// Lists answer records for leaderboard questions.
   Future<Object?> listQuestionAnswerRecords([Map<String, Object?>? payload]) =>
       post('/acgoMatch/questionAnsweRecord/list', payload);
 
+  /// Fetches a single leaderboard answer record.
   Future<Object?> viewQuestionAnswerRecord([Map<String, Object?>? payload]) =>
       post('/acgoMatch/questionAnsweRecord/view', payload);
 
+  /// Returns available practice match sources.
   Future<Object?> getPracticeMatchSources() =>
       get('/acgoMatch/v1/practice/matchSource/all');
 
+  /// Returns the practice selection menu.
   Future<Object?> getPracticeSelectMenu([Map<String, Object?>? params]) =>
       get('/acgoMatch/v1/practice/selectMenu', params: params);
 
+  /// Verifies whether the current user can enter practice mode.
   Future<Object?> verifyPracticeMatch([Map<String, Object?>? params]) =>
       get('/acgoMatch/v1/practice/verifyMatch', params: params);
 
+  /// Fetches a practice paper, optionally from the open variant.
   Future<Object?> getPracticePaper([
     Map<String, Object?>? params,
     bool open = false,
@@ -1037,6 +1164,7 @@ class AcgoClient {
         params: params,
       );
 
+  /// Fetches a practice answer record, optionally from the open variant.
   Future<Object?> getPracticeAnswerRecord([
     Map<String, Object?>? params,
     bool open = false,
@@ -1046,6 +1174,7 @@ class AcgoClient {
         params: params,
       );
 
+  /// Fetches and merges practice paper and answer data.
   Future<Map<String, Object?>> getPracticeQuestions([
     Map<String, Object?>? params,
     bool open = false,
@@ -1055,17 +1184,17 @@ class AcgoClient {
     return _mergePaperAndAnswerRecord(paper, record);
   }
 
+  /// Fetches the practice match score.
   Future<Object?> getPracticeMatchScore([Map<String, Object?>? params]) =>
       get('/acgoMatch/v1/practice/matchScore', params: params);
 
+  /// Subscribes to real-time private messages for the given receiver.
   Stream<Map<String, Object?>> watchPrivateMessages(
     String receiverId, {
     String? userId,
     String? userConversationsId,
     String messageId = '0',
   }) {
-    final controller = StreamController<Map<String, Object?>>();
-    var cancelled = false;
     final currentUserId = userId?.trim();
     if (currentUserId == null || currentUserId.isEmpty) {
       return Stream.error(
@@ -1074,6 +1203,22 @@ class AcgoClient {
         ),
       );
     }
+    privateMessageUserId = currentUserId;
+    if (Platform.isLinux || Platform.isWindows) {
+      return _watchPrivateMessagesWithDesktopWebRtm(
+        receiverId,
+        currentUserId,
+      );
+    }
+    if (Platform.isMacOS) {
+      return Stream.error(
+        UnsupportedError(
+          'ACGO RTM desktop push currently supports Linux and Windows only.',
+        ),
+      );
+    }
+    final controller = StreamController<Map<String, Object?>>();
+    var cancelled = false;
 
     RtmClient? rtmClient;
     var cleaned = false;
@@ -1188,6 +1333,116 @@ class AcgoClient {
     return controller.stream;
   }
 
+  Stream<Map<String, Object?>> _watchPrivateMessagesWithDesktopWebRtm(
+    String receiverId,
+    String currentUserId,
+  ) {
+    final controller = StreamController<Map<String, Object?>>();
+    _DesktopRtmBridge? bridge;
+    StreamSubscription<Map<String, Object?>>? subscription;
+    var cleaned = false;
+
+    late Future<void> Function() cleanup;
+    cleanup = () async {
+      if (cleaned) return;
+      cleaned = true;
+      await subscription?.cancel();
+      await bridge?.release();
+      if (!controller.isClosed) await controller.close();
+      _rtmCleanups.remove(cleanup);
+    };
+
+    Future<void> start() async {
+      try {
+        bridge = await _desktopRtmBridgeForUser(currentUserId);
+        bridge!.retain();
+        await bridge!.ready;
+        subscription = bridge!.messages.listen(
+          (message) {
+            if ('${message['sendId']}' != receiverId ||
+                '${message['receiveId']}' != currentUserId) {
+              return;
+            }
+            controller.add(message);
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (!controller.isClosed) controller.addError(error, stackTrace);
+          },
+          onDone: () {
+            if (!cleaned) unawaited(cleanup());
+          },
+        );
+      } catch (error, stackTrace) {
+        if (!controller.isClosed) controller.addError(error, stackTrace);
+        await cleanup();
+      }
+    }
+
+    _rtmCleanups.add(cleanup);
+    controller.onListen = () => unawaited(start());
+    controller.onCancel = cleanup;
+    return controller.stream;
+  }
+
+  Future<_DesktopRtmBridge> _desktopRtmBridgeForUser(
+      String currentUserId) async {
+    final existing = _desktopRtmBridges[currentUserId];
+    if (existing != null && !existing.closed) return existing;
+    final bridge = await _DesktopRtmBridge.start(
+      appId: privateMessageRtmAppId,
+      userId: currentUserId,
+      getToken: getPrivateMessageRtmToken,
+      onClosed: () => _desktopRtmBridges.remove(currentUserId),
+    );
+    _desktopRtmBridges[currentUserId] = bridge;
+    return bridge;
+  }
+
+  Future<void> _publishDesktopPrivateMessage({
+    required String receiverId,
+    required Object messageType,
+    required Object? message,
+    required Object? sendResult,
+  }) async {
+    final currentUserId = privateMessageUserId?.trim();
+    if (currentUserId == null || currentUserId.isEmpty) return;
+    final bridge = await _desktopRtmBridgeForUser(currentUserId);
+    final payload = <String, Object?>{
+      'messageType': messageType,
+      'message': message,
+      'receiveId': int.tryParse(receiverId) ?? receiverId,
+      'sendId': int.tryParse(currentUserId) ?? currentUserId,
+      'messageId': _firstPayloadString(sendResult, const ['messageId', 'id']),
+      'timestamp': _firstPayloadValue(sendResult, const ['timestamp']),
+    }..removeWhere((_, value) => value == null);
+    await bridge.publish('inbox_$receiverId', payload);
+  }
+
+  Object? _firstPayloadValue(Object? payload, List<String> keys) {
+    final seen = HashSet.identity();
+    final stack = <Object?>[payload];
+    while (stack.isNotEmpty) {
+      final current = stack.removeLast();
+      if (current is Map) {
+        if (!seen.add(current)) continue;
+        for (final key in keys) {
+          final value = current[key];
+          if (value != null) return value;
+        }
+        stack.addAll(current.values);
+      } else if (current is List) {
+        if (!seen.add(current)) continue;
+        stack.addAll(current.reversed);
+      }
+    }
+    return null;
+  }
+
+  String? _firstPayloadString(Object? payload, List<String> keys) {
+    final value = _firstPayloadValue(payload, keys);
+    return value == null || '$value'.isEmpty ? null : '$value';
+  }
+
   Map<String, Object?> _mergePaperAndAnswerRecord(
     Object? paperPayload,
     Object? recordPayload,
@@ -1276,35 +1531,6 @@ class AcgoClient {
     return payload;
   }
 
-  List<Object?> _extractPrivateMessages(Object? payload) {
-    final data = _payloadData(payload);
-    if (data is Map && data['list'] is List)
-      return data['list'] as List<Object?>;
-    if (data is Map && data['records'] is List)
-      return data['records'] as List<Object?>;
-    if (data is Map && data['messages'] is List)
-      return data['messages'] as List<Object?>;
-    if (data is List) return data;
-    return const [];
-  }
-
-  String? _messageId(Map<String, Object?> message) {
-    for (final key in ['messageId', 'id', 'chatId', 'msgId']) {
-      final value = message[key];
-      if (value != null && '$value'.isNotEmpty) return '$value';
-    }
-    return null;
-  }
-
-  int _compareMessageId(Map<String, Object?> left, Map<String, Object?> right) {
-    final l = _messageId(left);
-    final r = _messageId(right);
-    final ln = int.tryParse(l ?? '');
-    final rn = int.tryParse(r ?? '');
-    if (ln != null && rn != null && ln != rn) return ln.compareTo(rn);
-    return (l ?? '').compareTo(r ?? '');
-  }
-
   Map<String, Object?>? _findQuestionAnswer(
     List answerList,
     Object? problemSetId,
@@ -1340,6 +1566,7 @@ class AcgoClient {
   List<Object?> _deepCopyList(List value) =>
       (jsonDecode(jsonEncode(value)) as List).cast<Object?>();
 
+  /// Submits code for a problem.
   Future<Object?> submitProblem(
     String problemId,
     String code,
@@ -1355,10 +1582,447 @@ class AcgoClient {
         'language': language,
       });
 
+  /// Closes the underlying HTTP client and RTM subscriptions.
   void close() {
     for (final cleanup in List<Future<void> Function()>.from(_rtmCleanups)) {
       unawaited(cleanup());
     }
+    for (final bridge in List<_DesktopRtmBridge>.from(
+      _desktopRtmBridges.values,
+    )) {
+      unawaited(bridge.close());
+    }
+    _desktopRtmBridges.clear();
     _http.close(force: true);
+  }
+}
+
+/// Runs the official Agora Web RTM SDK in a headless desktop browser.
+///
+/// Agora's Flutter RTM package does not provide Linux or Windows native
+/// wrappers. The web SDK officially supports Chrome on both platforms, so the
+/// bridge hosts the bundled SDK on a loopback-only server and relays only RTM
+/// events to Dart. The local server is protected with a per-session key.
+class _DesktopRtmBridge {
+  _DesktopRtmBridge._({
+    required HttpServer server,
+    required Directory profileDirectory,
+    required Process process,
+    required String secret,
+    required String appId,
+    required String userId,
+    required Future<String> Function() getToken,
+    required void Function() onClosed,
+  })  : _server = server,
+        _profileDirectory = profileDirectory,
+        _process = process,
+        _secret = secret,
+        _appId = appId,
+        _userId = userId,
+        _getToken = getToken,
+        _onClosed = onClosed;
+
+  static const _bridgeHeader = 'x-acgo-rtm-bridge';
+  static const _rtcAssetPath = '/agora-rtc-4.22.0.js';
+  static const _rtmAssetPath = '/agora-rtm-2.2.1.js';
+
+  final HttpServer _server;
+  final Directory _profileDirectory;
+  final Process _process;
+  final String _secret;
+  final String _appId;
+  final String _userId;
+  final Future<String> Function() _getToken;
+  final void Function() _onClosed;
+  final StreamController<Map<String, Object?>> _messages =
+      StreamController<Map<String, Object?>>.broadcast();
+  final Completer<void> _ready = Completer<void>();
+  final Map<int, Completer<void>> _pendingCommands = {};
+  final Queue<Map<String, Object?>> _commandQueue =
+      Queue<Map<String, Object?>>();
+  int _nextCommandId = 0;
+  int _retainCount = 0;
+  var _closed = false;
+
+  /// Returns messages received from the subscribed ACGO inbox channel.
+  Stream<Map<String, Object?>> get messages => _messages.stream;
+
+  /// Whether the bridge has already been closed.
+  bool get closed => _closed;
+
+  /// Completes after the official Web SDK logs in and subscribes to the inbox.
+  Future<void> get ready => _ready.future;
+
+  /// Starts the loopback bridge and opens it in Chrome or Edge headless mode.
+  static Future<_DesktopRtmBridge> start({
+    required String appId,
+    required String userId,
+    required Future<String> Function() getToken,
+    required void Function() onClosed,
+  }) async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final profileDirectory = await Directory.systemTemp.createTemp(
+      'acgo-rtm-browser-',
+    );
+    final secret = base64UrlEncode(
+      List<int>.generate(32, (_) => Random.secure().nextInt(256)),
+    );
+
+    try {
+      final url = Uri(
+        scheme: 'http',
+        host: InternetAddress.loopbackIPv4.address,
+        port: server.port,
+        queryParameters: {'key': secret},
+      );
+      final process = await _startHeadlessBrowser(url, profileDirectory);
+      final bridge = _DesktopRtmBridge._(
+        server: server,
+        profileDirectory: profileDirectory,
+        process: process,
+        secret: secret,
+        appId: appId,
+        userId: userId,
+        getToken: getToken,
+        onClosed: onClosed,
+      );
+      unawaited(bridge._serveRequests());
+      unawaited(bridge._watchProcess());
+      return bridge;
+    } catch (_) {
+      await server.close(force: true);
+      if (await profileDirectory.exists()) {
+        await profileDirectory.delete(recursive: true);
+      }
+      rethrow;
+    }
+  }
+
+  /// Keeps the shared browser session alive for one active watcher.
+  void retain() {
+    if (_closed) return;
+    _retainCount += 1;
+  }
+
+  /// Releases one watcher reference and closes when no watcher remains.
+  Future<void> release() async {
+    if (_retainCount > 0) _retainCount -= 1;
+    if (_retainCount == 0) await close();
+  }
+
+  /// Publishes a JSON message to an Agora RTM channel through the web SDK.
+  Future<void> publish(String channel, Map<String, Object?> message) async {
+    if (_closed) throw StateError('ACGO RTM desktop bridge is closed.');
+    await ready;
+    final id = _nextCommandId++;
+    final completer = Completer<void>();
+    _pendingCommands[id] = completer;
+    _commandQueue.add({
+      'id': id,
+      'type': 'publish',
+      'channel': channel,
+      'message': message,
+    });
+    return completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        _pendingCommands.remove(id);
+        throw TimeoutException('ACGO RTM publish timed out.');
+      },
+    );
+  }
+
+  static Future<Process> _startHeadlessBrowser(
+    Uri url,
+    Directory profileDirectory,
+  ) async {
+    final arguments = [
+      '--headless=new',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--user-data-dir=${profileDirectory.path}',
+      url.toString(),
+    ];
+    ProcessException? lastError;
+    for (final executable in _desktopBrowserExecutables()) {
+      try {
+        final process = await Process.start(executable, arguments);
+        unawaited(process.stdout.drain<void>());
+        unawaited(process.stderr.drain<void>());
+        return process;
+      } on ProcessException catch (error) {
+        lastError = error;
+      }
+    }
+    throw UnsupportedError(
+      'ACGO RTM desktop push requires Google Chrome or Microsoft Edge. '
+      'Install Chrome 93+ on Linux or Chrome 90+/Edge 113+ on Windows. '
+      '${lastError?.message ?? ''}',
+    );
+  }
+
+  static Iterable<String> _desktopBrowserExecutables() sync* {
+    if (Platform.isLinux) {
+      yield 'google-chrome';
+      yield 'google-chrome-stable';
+      yield 'chromium';
+      yield 'chromium-browser';
+      return;
+    }
+    if (Platform.isWindows) {
+      final programFiles = [
+        Platform.environment['PROGRAMFILES'],
+        Platform.environment['PROGRAMFILES(X86)'],
+        Platform.environment['LOCALAPPDATA'],
+      ].whereType<String>();
+      for (final directory in programFiles) {
+        yield '$directory\\Google\\Chrome\\Application\\chrome.exe';
+        yield '$directory\\Microsoft\\Edge\\Application\\msedge.exe';
+      }
+      yield 'chrome.exe';
+      yield 'msedge.exe';
+    }
+  }
+
+  Future<void> _serveRequests() async {
+    try {
+      await for (final request in _server) {
+        await _handleRequest(request);
+      }
+    } on Object catch (error, stackTrace) {
+      if (!_closed && !_messages.isClosed) {
+        _messages.addError(error, stackTrace);
+      }
+    }
+  }
+
+  Future<void> _watchProcess() async {
+    final exitCode = await _process.exitCode;
+    if (!_ready.isCompleted) {
+      _ready.completeError(
+        StateError('ACGO RTM desktop browser exited unexpectedly ($exitCode).'),
+      );
+    }
+    if (!_closed && !_messages.isClosed) {
+      _messages.addError(
+        StateError('ACGO RTM desktop browser exited unexpectedly ($exitCode).'),
+      );
+    }
+    await close();
+  }
+
+  Future<void> _handleRequest(HttpRequest request) async {
+    if (!_isAuthorized(request)) {
+      request.response.statusCode = HttpStatus.forbidden;
+      await request.response.close();
+      return;
+    }
+    switch (request.uri.path) {
+      case '/':
+        await _writeText(
+          request.response,
+          _pageHtml(),
+          ContentType.html,
+        );
+      case _rtcAssetPath:
+        await _writeAsset(
+          request.response,
+          'packages/acgo_sdk/assets/desktop_rtm/agora-rtc-4.22.0.js',
+        );
+      case _rtmAssetPath:
+        await _writeAsset(
+          request.response,
+          'packages/acgo_sdk/assets/desktop_rtm/agora-rtm-2.2.1.js',
+        );
+      case '/token':
+        await _writeToken(request);
+      case '/event':
+        await _readEvent(request);
+      case '/command':
+        await _writeCommand(request);
+      default:
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+    }
+  }
+
+  bool _isAuthorized(HttpRequest request) {
+    final queryKey = request.uri.queryParameters['key'];
+    final headerKey = request.headers.value(_bridgeHeader);
+    return queryKey == _secret || headerKey == _secret;
+  }
+
+  Future<void> _writeAsset(HttpResponse response, String assetKey) async {
+    final data = await rootBundle.load(assetKey);
+    response.headers.contentType = ContentType('application', 'javascript');
+    response.headers.contentLength = data.lengthInBytes;
+    response
+        .add(data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes));
+    await response.close();
+  }
+
+  Future<void> _writeText(
+    HttpResponse response,
+    String value,
+    ContentType contentType,
+  ) async {
+    final bytes = utf8.encode(value);
+    response.headers.contentType = contentType;
+    response.headers.contentLength = bytes.length;
+    response.add(bytes);
+    await response.close();
+  }
+
+  Future<void> _writeToken(HttpRequest request) async {
+    try {
+      final token = await _getToken();
+      await _writeText(
+        request.response,
+        jsonEncode({'token': token}),
+        ContentType.json,
+      );
+    } catch (error) {
+      request.response.statusCode = HttpStatus.badGateway;
+      await _writeText(
+        request.response,
+        jsonEncode({'error': '$error'}),
+        ContentType.json,
+      );
+    }
+  }
+
+  Future<void> _readEvent(HttpRequest request) async {
+    try {
+      final text = await utf8.decoder.bind(request).join();
+      final decoded = jsonDecode(text);
+      if (decoded is! Map) throw const FormatException('Invalid RTM event');
+      final event = Map<String, Object?>.from(decoded);
+      switch (event['type']) {
+        case 'ready':
+          if (!_ready.isCompleted) _ready.complete();
+        case 'message':
+          final message = event['message'];
+          if (message is Map) {
+            _messages.add(Map<String, Object?>.from(message));
+          }
+        case 'error':
+          final error = StateError('ACGO Web RTM error: ${event['message']}');
+          if (!_ready.isCompleted) _ready.completeError(error);
+          if (!_messages.isClosed) {
+            _messages.addError(error);
+          }
+        case 'commandResult':
+          final id = event['id'];
+          final completer = id is int ? _pendingCommands.remove(id) : null;
+          if (completer != null && !completer.isCompleted) {
+            final ok = event['ok'] == true;
+            if (ok) {
+              completer.complete();
+            } else {
+              completer.completeError(
+                StateError('ACGO RTM command failed: ${event['message']}'),
+              );
+            }
+          }
+      }
+      await _writeText(request.response, '{}', ContentType.json);
+    } catch (error, stackTrace) {
+      if (!_messages.isClosed) _messages.addError(error, stackTrace);
+      request.response.statusCode = HttpStatus.badRequest;
+      await _writeText(request.response, '{}', ContentType.json);
+    }
+  }
+
+  Future<void> _writeCommand(HttpRequest request) async {
+    final command = _commandQueue.isEmpty
+        ? <String, Object?>{}
+        : _commandQueue.removeFirst();
+    await _writeText(request.response, jsonEncode(command), ContentType.json);
+  }
+
+  String _pageHtml() {
+    final config = jsonEncode({'appId': _appId, 'userId': _userId});
+    final rtcUrl = '$_rtcAssetPath?key=$_secret';
+    final rtmUrl = '$_rtmAssetPath?key=$_secret';
+    return '''
+<!doctype html>
+<html><head><meta charset="utf-8">
+<script src="$rtcUrl"></script>
+<script src="$rtmUrl"></script>
+</head><body><script>
+const bridgeKey = ${jsonEncode(_secret)};
+const config = $config;
+const bridgeHeaders = { "$_bridgeHeader": bridgeKey, "content-type": "application/json" };
+let rtm = null;
+const post = (event) => fetch("/event", {
+  method: "POST", headers: bridgeHeaders, body: JSON.stringify(event)
+}).catch(() => {});
+const getToken = async () => {
+  const response = await fetch("/token", { headers: { "$_bridgeHeader": bridgeKey } });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Unable to obtain ACGO RTM token");
+  return payload.token;
+};
+(async () => {
+  try {
+    rtm = new AgoraRTM.RTM(config.appId, config.userId, { logUpload: false });
+    rtm.addEventListener("message", (event) => {
+      if (event.channelName !== "inbox_" + config.userId || typeof event.message !== "string") return;
+      try { post({ type: "message", message: JSON.parse(event.message) }); } catch (_) {}
+    });
+    rtm.addEventListener("tokenPrivilegeWillExpire", async () => {
+      try { await rtm.renewToken(await getToken()); }
+      catch (error) { post({ type: "error", message: "Token renewal failed: " + String(error) }); }
+    });
+    rtm.addEventListener("status", (event) => post({ type: "status", status: event }));
+    await rtm.login({ token: await getToken() });
+    await rtm.subscribe("inbox_" + config.userId, {
+      withMessage: true, withMetadata: false, withPresence: false, withLock: false, beQuiet: false
+    });
+    post({ type: "ready" });
+  } catch (error) {
+    post({ type: "error", message: String(error && (error.message || error.reason) || error) });
+  }
+})();
+const commandLoop = async () => {
+  try {
+    const response = await fetch("/command", { headers: { "$_bridgeHeader": bridgeKey } });
+    const command = await response.json();
+    if (command && command.type === "publish" && rtm) {
+      try {
+        await rtm.publish(command.channel, JSON.stringify(command.message));
+        post({ type: "commandResult", id: command.id, ok: true });
+      } catch (error) {
+        post({ type: "commandResult", id: command.id, ok: false,
+          message: String(error && (error.message || error.reason) || error) });
+      }
+    }
+  } catch (error) {
+    post({ type: "error", message: "Command loop failed: " + String(error) });
+  }
+  setTimeout(commandLoop, 200);
+};
+commandLoop();
+</script></body></html>
+''';
+  }
+
+  /// Stops the browser and removes the per-session browser profile.
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    await _server.close(force: true);
+    if (_process.kill()) {
+      await _process.exitCode;
+    }
+    if (await _profileDirectory.exists()) {
+      await _profileDirectory.delete(recursive: true);
+    }
+    if (!_messages.isClosed) await _messages.close();
+    if (!_ready.isCompleted) {
+      _ready.completeError(StateError('ACGO RTM desktop bridge was closed.'));
+    }
+    _onClosed();
   }
 }

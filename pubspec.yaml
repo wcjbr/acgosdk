@@ -9,3 +9,12 @@ dependencies:
   agora_rtm: ^2.2.6
   flutter:
     sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  assets:
+    - assets/desktop_rtm/agora-rtc-4.22.0.js
+    - assets/desktop_rtm/agora-rtm-2.2.1.js
