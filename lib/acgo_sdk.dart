@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:agora_rtm/agora_rtm.dart';
 import 'package:crypto/crypto.dart';
 
 class AcgoApiException implements Exception {
@@ -104,6 +105,7 @@ class AcgoClient {
   }
 
   static const privateMessagePath = '/acgoMsg/conversations/sendMessage';
+  static const privateMessageRtmAppId = '775e0ae964ed41d79e9ca817ee6d4b47';
   static const imageUploadHost = 'https://wsupload.xiaomawang.com';
   static const imageDirectUploadMaxBytes = 4 * 1024 * 1024;
   static const imageExtensions = {'jpg', 'jpeg', 'png', 'gif'};
@@ -129,6 +131,7 @@ class AcgoClient {
   late AcgoSigner signer;
   final HttpClient _http = HttpClient();
   final Random _random = Random.secure();
+  final Set<Future<void> Function()> _rtmCleanups = {};
 
   Uri _url(String path, [Map<String, Object?>? params]) {
     final uri = Uri.parse(path.startsWith('http') ? path : '$baseUrl$path');
@@ -467,6 +470,15 @@ class AcgoClient {
 
   Future<Object?> getPrivateConversation(String receiverId) =>
       getRaw('/acgoMsg/conversations/get', params: {'receiverId': receiverId});
+
+  Future<String> getPrivateMessageRtmToken() async {
+    final payload = await getRaw('/acgoMsg/conversations/token');
+    final token = _findFirstString(payload, ['token']);
+    if (token == null) {
+      throw StateError('ACGO RTM token missing from response');
+    }
+    return token;
+  }
 
   Future<Object?> listPrivateMessages(
     String userConversationsId, {
@@ -1048,55 +1060,131 @@ class AcgoClient {
 
   Stream<Map<String, Object?>> watchPrivateMessages(
     String receiverId, {
+    String? userId,
     String? userConversationsId,
     String messageId = '0',
-    Duration interval = const Duration(seconds: 2),
   }) {
     final controller = StreamController<Map<String, Object?>>();
     var cancelled = false;
-
-    Future<void> loop() async {
-      final conversationId = userConversationsId ??
-          await _resolvePrivateConversationId(receiverId);
-      if (conversationId == null) {
-        throw StateError('private conversation not found for $receiverId');
-      }
-      var cursor = messageId;
-      final seen = <String>{};
-
-      while (!cancelled) {
-        final payload =
-            await listPrivateMessages(conversationId!, messageId: cursor);
-        final messages = _extractPrivateMessages(payload);
-        final fresh = <Map<String, Object?>>[];
-        for (final item in messages) {
-          if (item is! Map) continue;
-          final message = Map<String, Object?>.from(item);
-          final id = _messageId(message);
-          if (id == null || seen.contains(id)) continue;
-          seen.add(id);
-          fresh.add(message);
-        }
-        fresh.sort(_compareMessageId);
-        if (fresh.isNotEmpty) {
-          final latestId = _messageId(fresh.last);
-          if (latestId != null) cursor = latestId;
-          for (final item in fresh) {
-            if (!controller.isClosed) controller.add(item);
-          }
-        }
-        if (cancelled) break;
-        await Future<void>.delayed(interval);
-      }
-      if (!controller.isClosed) await controller.close();
+    final currentUserId = userId?.trim();
+    if (currentUserId == null || currentUserId.isEmpty) {
+      return Stream.error(
+        ArgumentError(
+          'userId is required for ACGO RTM private message subscription',
+        ),
+      );
     }
 
-    controller.onListen = () {
-      loop();
-    };
-    controller.onCancel = () async {
+    RtmClient? rtmClient;
+    var cleaned = false;
+    late void Function(MessageEvent event) onMessage;
+    late void Function(TokenEvent event) onToken;
+    late Future<void> Function() cleanup;
+
+    Future<void> start() async {
+      try {
+        final token = await getPrivateMessageRtmToken();
+        if (cancelled) return;
+        final (createStatus, client) = await RTM(
+          privateMessageRtmAppId,
+          currentUserId,
+        );
+        if (createStatus.error) {
+          throw StateError(
+            'ACGO RTM create failed: ${createStatus.errorCode} '
+            '${createStatus.reason}',
+          );
+        }
+        rtmClient = client;
+        onMessage = (event) {
+          if (cancelled ||
+              event.channelName != 'inbox_$currentUserId' ||
+              event.message == null) {
+            return;
+          }
+          try {
+            final decoded = jsonDecode(utf8.decode(event.message!));
+            if (decoded is! Map) return;
+            final message = Map<String, Object?>.from(decoded);
+            if ('${message['sendId']}' != receiverId ||
+                '${message['receiveId']}' != currentUserId) {
+              return;
+            }
+            controller.add(message);
+          } catch (_) {}
+        };
+        onToken = (event) {
+          if (event.eventType != RtmTokenEventType.willExpire) return;
+          unawaited(
+            getPrivateMessageRtmToken()
+                .then((nextToken) => rtmClient!.renewToken(nextToken))
+                .then((result) {
+              if (result.$1.error && !controller.isClosed) {
+                controller.addError(
+                  StateError(
+                    'ACGO RTM token renewal failed: '
+                    '${result.$1.errorCode} ${result.$1.reason}',
+                  ),
+                );
+              }
+            }).catchError((error, stackTrace) {
+              if (!controller.isClosed) {
+                controller.addError(error, stackTrace);
+              }
+            }),
+          );
+        };
+        rtmClient!.addListener(message: onMessage, token: onToken);
+        final loginStatus = (await rtmClient!.login(token)).$1;
+        if (loginStatus.error) {
+          throw StateError(
+            'ACGO RTM login failed: ${loginStatus.errorCode} '
+            '${loginStatus.reason}',
+          );
+        }
+        final subscribeStatus = (await rtmClient!.subscribe(
+          'inbox_$currentUserId',
+          withMessage: true,
+          withMetadata: false,
+          withPresence: false,
+          withLock: false,
+          beQuiet: false,
+        ))
+            .$1;
+        if (subscribeStatus.error) {
+          throw StateError(
+            'ACGO RTM subscribe failed: ${subscribeStatus.errorCode} '
+            '${subscribeStatus.reason}',
+          );
+        }
+      } catch (error, stackTrace) {
+        if (!controller.isClosed && !cancelled) {
+          controller.addError(error, stackTrace);
+        }
+        await cleanup();
+      }
+    }
+
+    cleanup = () async {
+      if (cleaned) return;
+      cleaned = true;
       cancelled = true;
+      if (!controller.isClosed) await controller.close();
+      final client = rtmClient;
+      if (client != null) {
+        try {
+          client.removeListener(message: onMessage, token: onToken);
+          await client.logout();
+        } catch (_) {}
+        try {
+          await client.release();
+        } catch (_) {}
+      }
+      _rtmCleanups.remove(cleanup);
     };
+    _rtmCleanups.add(cleanup);
+    controller.onListen = start;
+    controller.onCancel = cleanup;
     return controller.stream;
   }
 
@@ -1268,6 +1356,9 @@ class AcgoClient {
       });
 
   void close() {
+    for (final cleanup in List<Future<void> Function()>.from(_rtmCleanups)) {
+      unawaited(cleanup());
+    }
     _http.close(force: true);
   }
 }

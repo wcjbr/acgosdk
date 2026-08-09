@@ -6,3 +6,6 @@ environment:
 
 dependencies:
   crypto: ^3.0.6
+  agora_rtm: ^2.2.6
+  flutter:
+    sdk: flutter
