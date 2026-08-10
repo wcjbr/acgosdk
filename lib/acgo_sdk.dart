@@ -535,6 +535,21 @@ class AcgoClient {
     return null;
   }
 
+  List<Object?> _findList(Object? payload, List<String> keys) {
+    if (payload is List) return payload.cast<Object?>();
+    if (payload is Map) {
+      for (final key in keys) {
+        final value = payload[key];
+        if (value is List) return value.cast<Object?>();
+      }
+      for (final value in payload.values) {
+        final result = _findList(value, keys);
+        if (result.isNotEmpty) return result;
+      }
+    }
+    return const [];
+  }
+
   /// Lists the current user's private conversations.
   Future<Object?> listPrivateConversations({
     String lastUserConversations = '0',
@@ -1208,6 +1223,8 @@ class AcgoClient {
       return _watchPrivateMessagesWithDesktopWebRtm(
         receiverId,
         currentUserId,
+        userConversationsId: userConversationsId,
+        messageId: messageId,
       );
     }
     if (Platform.isMacOS) {
@@ -1335,8 +1352,10 @@ class AcgoClient {
 
   Stream<Map<String, Object?>> _watchPrivateMessagesWithDesktopWebRtm(
     String receiverId,
-    String currentUserId,
-  ) {
+    String currentUserId, {
+    String? userConversationsId,
+    required String messageId,
+  }) {
     final controller = StreamController<Map<String, Object?>>();
     _DesktopRtmBridge? bridge;
     StreamSubscription<Map<String, Object?>>? subscription;
@@ -1372,15 +1391,86 @@ class AcgoClient {
             if (!cleaned) unawaited(cleanup());
           },
         );
-      } catch (error, stackTrace) {
-        if (!controller.isClosed) controller.addError(error, stackTrace);
-        await cleanup();
+      } catch (error) {
+        await bridge?.release();
+        bridge = null;
+        if (cleaned || controller.isClosed) return;
+        // A missing Chrome/Edge installation is a normal desktop setup case.
+        // Keep the same public stream alive and transparently use REST polling.
+        subscription = _watchPrivateMessagesByPolling(
+          receiverId,
+          userConversationsId ?? receiverId,
+          messageId: messageId,
+        ).listen(
+          controller.add,
+          onError: controller.addError,
+        );
       }
     }
 
     _rtmCleanups.add(cleanup);
     controller.onListen = () => unawaited(start());
     controller.onCancel = cleanup;
+    return controller.stream;
+  }
+
+  Stream<Map<String, Object?>> _watchPrivateMessagesByPolling(
+    String receiverId,
+    String userConversationsId, {
+    required String messageId,
+  }) {
+    final controller = StreamController<Map<String, Object?>>();
+    var cursor = messageId.isEmpty ? '0' : messageId;
+    var cancelled = false;
+    var requestInFlight = false;
+    Timer? timer;
+
+    Future<void> poll() async {
+      if (cancelled || requestInFlight) return;
+      requestInFlight = true;
+      try {
+        final payload = await listPrivateMessages(
+          userConversationsId,
+          messageId: cursor,
+        );
+        final items =
+            _findList(payload, const ['list', 'records', 'items', 'data']);
+        for (final item in items.whereType<Map>()) {
+          final message = Map<String, Object?>.from(item);
+          final nextCursor =
+              _findFirstString(message, const ['messageId', 'id']);
+          if (nextCursor != null && nextCursor != cursor) {
+            cursor = nextCursor;
+          }
+          final sendId =
+              _findFirstString(message, const ['sendId', 'senderId']);
+          final receiveId =
+              _findFirstString(message, const ['receiveId', 'receiverId']);
+          if (sendId != receiverId || receiveId != privateMessageUserId) {
+            continue;
+          }
+          if (!cancelled) controller.add(message);
+        }
+      } catch (error, stackTrace) {
+        if (!cancelled && !controller.isClosed) {
+          controller.addError(error, stackTrace);
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    }
+
+    controller.onListen = () {
+      unawaited(poll());
+      timer = Timer.periodic(const Duration(seconds: 5), (_) {
+        unawaited(poll());
+      });
+    };
+    controller.onCancel = () async {
+      cancelled = true;
+      timer?.cancel();
+      timer = null;
+    };
     return controller.stream;
   }
 
